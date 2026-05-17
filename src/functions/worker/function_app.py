@@ -193,6 +193,12 @@ def service_bus_processing_worker(azservicebus: func.ServiceBusMessage, signalRM
     if not document_id or not file_name:
         raise ValueError("Message invalide : documentId ou fileName manquant")
 
+    # ----- DÉBUT SIMULATION DLQ -----
+    if "crash.pdf" in file_name.lower():
+        logger.error("💥 Simulation de crash demandée pour crash.pdf !")
+        raise Exception("Crash simulé pour tester la Dead Letter Queue")
+    # ----- FIN SIMULATION DLQ -----
+
     signalr_events = []
 
     try:

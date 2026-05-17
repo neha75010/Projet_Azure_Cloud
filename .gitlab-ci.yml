@@ -1,0 +1,84 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  # Ces variables doivent être configurées dans :
+  # GitLab > Settings > CI/CD > Variables
+  # 
+  # AZURE_CLIENT_ID
+  # AZURE_CLIENT_SECRET
+  # AZURE_TENANT_ID
+  # AZURE_SUBSCRIPTION_ID
+  # AZURE_RESOURCE_GROUP
+  # AZURE_FUNCTION_APP_NAME
+  # AZURE_STATIC_WEB_APP_TOKEN
+  # COSMOS_ENDPOINT
+  # COSMOS_KEY
+  # SERVICE_BUS_CONNECTION_STRING
+  # SIGNALR_CONNECTION_STRING
+  # OPENAI_API_KEY
+
+# ==============================================================================
+# FRONTEND REACT (Azure Static Web Apps)
+# ==============================================================================
+build_frontend:
+  stage: build
+  image: node:22-alpine
+  script:
+    - cd src/web
+    - npm install
+    - npm run build
+  artifacts:
+    paths:
+      - src/web/dist/
+    expire_in: 1 day
+
+deploy_frontend:
+  stage: deploy
+  image: node:22-alpine
+  dependencies:
+    - build_frontend
+  script:
+    - npm install -g @azure/static-web-apps-cli
+    - swa deploy ./src/web/dist --deployment-token $AZURE_STATIC_WEB_APP_TOKEN --env production
+  only:
+    - main
+
+# ==============================================================================
+# BACKEND AZURE FUNCTIONS (Worker)
+# ==============================================================================
+deploy_functions:
+  stage: deploy
+  image: mcr.microsoft.com/azure-cli
+  script:
+    # 1. Connexion à Azure avec le Service Principal
+    - az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+    - az account set --subscription $AZURE_SUBSCRIPTION_ID
+
+    # 2. Injection des secrets dans les App Settings de la Function Azure
+    - >
+      az functionapp config appsettings set 
+      --resource-group $AZURE_RESOURCE_GROUP 
+      --name $AZURE_FUNCTION_APP_NAME 
+      --settings 
+      COSMOS_ENDPOINT="$COSMOS_ENDPOINT" 
+      COSMOS_KEY="$COSMOS_KEY" 
+      COSMOS_DATABASE="db-doc" 
+      COSMOS_CONTAINER="jobs" 
+      SERVICE_BUS_CONNECTION_STRING="$SERVICE_BUS_CONNECTION_STRING" 
+      SERVICE_BUS_QUEUE_NAME="document-processing" 
+      SIGNALR_CONNECTION_STRING="$SIGNALR_CONNECTION_STRING"
+      OPENAI_API_KEY="$OPENAI_API_KEY" 
+      OPENAI_MODEL="gpt-4o-mini"
+
+    # 3. Compression du code (Zip Deploy)
+    - apk add --no-cache zip
+    - cd src/functions/worker
+    - zip -r ../../../function.zip .
+    - cd ../../../
+
+    # 4. Déploiement
+    - az functionapp deployment source config-zip --resource-group $AZURE_RESOURCE_GROUP --name $AZURE_FUNCTION_APP_NAME --src function.zip
+  only:
+    - main
