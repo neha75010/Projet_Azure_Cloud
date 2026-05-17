@@ -1,7 +1,7 @@
 import axios from "axios";
 
 const api = axios.create({
-    baseURL: "https://api-doc-vl.azurewebsites.net",
+    baseURL: "http://localhost:8000",
 });
 
 export default api;
