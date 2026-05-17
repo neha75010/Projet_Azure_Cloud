@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 import azure.functions as func
 
 from shared.cosmos_client import get_job, patch_job
-from shared.queue_message import InvalidQueueMessageError, parse_queue_message
+from shared.queue_message import parse_queue_message
 from shared.servicebus_client import send_message
 from shared.signalr_client import build_job_update_event, push_job_update
 from shared.tagging import generate_tags
