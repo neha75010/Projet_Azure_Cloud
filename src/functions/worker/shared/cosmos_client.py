@@ -15,8 +15,11 @@ import logging
 import os
 
 from azure.cosmos import CosmosClient, ContainerProxy
+from azure.cosmos.exceptions import CosmosHttpResponseError
 
 logger = logging.getLogger(__name__)
+
+JOB_PARTITION_KEY = "JOB"
 
 _cosmos_client: CosmosClient | None = None
 _container: ContainerProxy | None = None
@@ -40,6 +43,17 @@ def get_cosmos_container() -> ContainerProxy:
     return _container
 
 
+def get_job(job_id: str) -> dict | None:
+    """Retourne le job ou None si introuvable."""
+    container = get_cosmos_container()
+    try:
+        return container.read_item(item=job_id, partition_key=JOB_PARTITION_KEY)
+    except CosmosHttpResponseError as exc:
+        if getattr(exc, "status_code", None) == 404:
+            return None
+        raise
+
+
 def patch_job(job_id: str, fields: dict) -> dict:
     """
     Lit le document Cosmos, applique les champs, met updatedAt, et remplace.
@@ -48,7 +62,7 @@ def patch_job(job_id: str, fields: dict) -> dict:
     from datetime import datetime, timezone
 
     container = get_cosmos_container()
-    item = container.read_item(item=job_id, partition_key="JOB")
+    item = container.read_item(item=job_id, partition_key=JOB_PARTITION_KEY)
     item.update(fields)
     item["updatedAt"] = datetime.now(timezone.utc).isoformat()
     container.replace_item(item=item, body=item)

@@ -1,7 +1,16 @@
 import { useState, useEffect, useRef } from "react";
-import * as signalR from "@microsoft/signalr";
 import api from "./services/api";
 import { uploadFileToBlob } from "./services/blob";
+import { subscribeJobUpdate } from "./services/signalr";
+
+const STATUS_ORDER = {
+  CREATED: 0,
+  UPLOADED: 1,
+  QUEUED: 2,
+  PROCESSING: 3,
+  PROCESSED: 4,
+  ERROR: 5,
+};
 
 function App() {
   const [file, setFile] = useState(null);
@@ -11,37 +20,37 @@ function App() {
   const [message, setMessage] = useState("");
   const [tags, setTags] = useState([]);
 
-  // Référence pour accéder à la valeur à jour de jobId dans la callback SignalR
   const jobIdRef = useRef("");
+  const seenStatusesRef = useRef(new Set());
+
   useEffect(() => {
     jobIdRef.current = jobId;
   }, [jobId]);
 
-  // Connexion SignalR au montage
   useEffect(() => {
-    const connection = new signalR.HubConnectionBuilder()
-      // URL de l'Azure Function locale qui expose /api/negotiate
-      .withUrl("http://localhost:7071/api")
-      .withAutomaticReconnect()
-      .build();
+    const onJobUpdate = (data) => {
+      if (data.documentId !== jobIdRef.current) return;
 
-    connection.on("jobUpdate", (data) => {
+      const dedupeKey = `${data.documentId}:${data.status}`;
+      if (seenStatusesRef.current.has(dedupeKey)) return;
+      seenStatusesRef.current.add(dedupeKey);
+
       console.log("🔔 SignalR jobUpdate:", data);
-      // On ne met à jour l'UI que si l'event concerne le job en cours
-      if (data.documentId === jobIdRef.current) {
-        setStatus(data.status);
-        if (data.message) setMessage(data.message);
-        if (data.tags) setTags(data.tags);
-      }
-    });
 
-    connection.start()
-      .then(() => console.log("✅ Connecté à Azure SignalR"))
-      .catch(err => console.error("❌ Erreur connexion SignalR:", err));
-
-    return () => {
-      connection.stop();
+      setStatus((prev) => {
+        const prevRank = STATUS_ORDER[prev] ?? -1;
+        const nextRank = STATUS_ORDER[data.status] ?? -1;
+        if (nextRank < prevRank && data.status !== "ERROR") return prev;
+        return data.status;
+      });
+      if (data.message) setMessage(data.message);
+      if (data.tags?.length) setTags(data.tags);
     };
+
+    const unsubscribe = subscribeJobUpdate(onJobUpdate);
+    console.log("✅ Abonné aux mises à jour SignalR");
+
+    return unsubscribe;
   }, []);
 
   const handleInitAndUpload = async () => {
@@ -61,8 +70,10 @@ function App() {
 
       const { jobId, uploadUrl, status } = initResponse.data;
 
+      seenStatusesRef.current = new Set();
       setJobId(jobId);
       setStatus(status);
+      setTags([]);
 
       await uploadFileToBlob(uploadUrl, file);
 
