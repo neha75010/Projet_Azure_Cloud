@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
+import * as signalR from "@microsoft/signalr";
 import api from "./services/api";
 import { uploadFileToBlob } from "./services/blob";
 
@@ -8,6 +9,40 @@ function App() {
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
+  const [tags, setTags] = useState([]);
+
+  // Référence pour accéder à la valeur à jour de jobId dans la callback SignalR
+  const jobIdRef = useRef("");
+  useEffect(() => {
+    jobIdRef.current = jobId;
+  }, [jobId]);
+
+  // Connexion SignalR au montage
+  useEffect(() => {
+    const connection = new signalR.HubConnectionBuilder()
+      // URL de l'Azure Function locale qui expose /api/negotiate
+      .withUrl("http://localhost:7071/api")
+      .withAutomaticReconnect()
+      .build();
+
+    connection.on("jobUpdate", (data) => {
+      console.log("🔔 SignalR jobUpdate:", data);
+      // On ne met à jour l'UI que si l'event concerne le job en cours
+      if (data.documentId === jobIdRef.current) {
+        setStatus(data.status);
+        if (data.message) setMessage(data.message);
+        if (data.tags) setTags(data.tags);
+      }
+    });
+
+    connection.start()
+      .then(() => console.log("✅ Connecté à Azure SignalR"))
+      .catch(err => console.error("❌ Erreur connexion SignalR:", err));
+
+    return () => {
+      connection.stop();
+    };
+  }, []);
 
   const handleInitAndUpload = async () => {
     if (!file) {
@@ -68,10 +103,18 @@ function App() {
       </div>
 
       {jobId && (
-        <div style={{ marginTop: 24 }}>
+        <div style={{ marginTop: 24, padding: 16, background: "#f5f5f5", borderRadius: 8 }}>
           <p><strong>Job ID :</strong> {jobId}</p>
-          <p><strong>Status :</strong> {status}</p>
-          <button onClick={checkJobStatus}>Vérifier le statut</button>
+          <p>
+            <strong>Status :</strong>{" "}
+            <span style={{ color: status === "ERROR" ? "red" : status === "PROCESSED" ? "green" : "blue" }}>
+              {status}
+            </span>
+          </p>
+          {tags.length > 0 && (
+            <p><strong>Tags générés :</strong> {tags.map(t => <span key={t} style={{marginRight: 8, background:"#ddd", padding:"2px 6px", borderRadius:4}}>{t}</span>)}</p>
+          )}
+          <button onClick={checkJobStatus} style={{ marginTop: 12 }}>Vérifier le statut manuellement</button>
         </div>
       )}
 

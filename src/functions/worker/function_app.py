@@ -1,11 +1,305 @@
-import azure.functions as func
-import logging
+"""
+function_app.py — Azure Function Worker
+========================================
+Blob Trigger : doc-storage/input/{name}
+Service Bus Trigger : document-processing
+Service Bus DLQ : document-processing/$DeadLetterQueue
+"""
 
+import logging
+import os
+import json
+from datetime import datetime, timezone
+
+import azure.functions as func
+
+from shared.cosmos_client import patch_job
+from shared.servicebus_client import send_message
+from shared.tagging import generate_tags
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = func.FunctionApp()
 
-@app.blob_trigger(arg_name="myblob", path="doc-storage/input/{name}",
-                               connection="docstorageprof_STORAGE") 
-def Test(myblob: func.InputStream):
-    logging.info(f"Version CI/CD => Python blob trigger function processed blob"
-                f"Name: {myblob.name}"
-                f"Blob Size: {myblob.length} bytes")
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_blob_path(blob_name: str) -> tuple[str, str]:
+    path = blob_name
+    for prefix in ("doc-storage/", "input/"):
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+            break
+
+    if path.startswith("input/"):
+        path = path[len("input/"):]
+
+    if "/" not in path:
+        raise ValueError(f"Chemin blob invalide (format attendu input/<jobId>/<fileName>) : {blob_name}")
+
+    document_id, file_name = path.split("/", 1)
+    if not document_id or not file_name:
+        raise ValueError(f"Chemin blob invalide (jobId ou fileName vide) : {blob_name}")
+
+    return document_id, file_name
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# SignalR Negotiate
+# ---------------------------------------------------------------------------
+@app.route(route="negotiate", auth_level=func.AuthLevel.ANONYMOUS)
+@app.generic_input_binding(
+    arg_name="connectionInfo",
+    type="signalRConnectionInfo",
+    hubName="documents",
+    connectionStringSetting="SIGNALR_CONNECTION_STRING"
+)
+def negotiate(req: func.HttpRequest, connectionInfo: str) -> func.HttpResponse:
+    """
+    Endpoint appelé par React pour obtenir le token d'accès SignalR.
+    """
+    return func.HttpResponse(
+        connectionInfo,
+        status_code=200,
+        headers={"Content-Type": "application/json"}
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. Blob Trigger
+# ---------------------------------------------------------------------------
+
+@app.blob_trigger(
+    arg_name="myblob",
+    path="doc-storage/input/{name}",
+    connection="docstorageprof_STORAGE",
+)
+@app.generic_output_binding(
+    arg_name="signalRMessages",
+    type="signalR",
+    hubName="documents",
+    connectionStringSetting="SIGNALR_CONNECTION_STRING"
+)
+def blob_upload_worker(myblob: func.InputStream, signalRMessages: func.Out[str]) -> None:
+    raw_name: str = myblob.name or ""
+    blob_size: int = myblob.length or 0
+
+    logger.info("=" * 60)
+    logger.info("[BlobTrigger] Nouveau blob détecté: %s", raw_name)
+
+    signalr_events = []
+
+    try:
+        document_id, file_name = _parse_blob_path(raw_name)
+    except ValueError as exc:
+        logger.error("[BlobTrigger] Parsing impossible — blob ignoré : %s", exc)
+        return
+
+    uploaded_at = _now_iso()
+    try:
+        patch_job(document_id, {
+            "status": "UPLOADED",
+            "size": blob_size,
+            "uploadedAt": uploaded_at,
+        })
+        signalr_events.append({
+            "target": "jobUpdate",
+            "arguments": [{
+                "documentId": document_id,
+                "status": "UPLOADED",
+                "message": "Fichier reçu"
+            }]
+        })
+    except Exception as exc:
+        logger.error("[Cosmos] Échec mise à jour UPLOADED : %s", exc)
+
+    message_payload = {
+        "documentId": document_id,
+        "fileName": file_name,
+        "blobName": raw_name,
+        "size": blob_size,
+        "uploadedAt": uploaded_at,
+    }
+
+    try:
+        send_message(message_payload)
+        logger.info("[ServiceBus] Message envoyé")
+    except Exception as exc:
+        logger.error("[ServiceBus] Échec envoi message : %s", exc)
+        try:
+            patch_job(document_id, {
+                "status": "ERROR",
+                "errorMessage": f"ServiceBus send failed: {exc}",
+                "errorAt": _now_iso(),
+            })
+        except Exception:
+            pass
+        return
+
+    try:
+        patch_job(document_id, {"status": "QUEUED"})
+        signalr_events.append({
+            "target": "jobUpdate",
+            "arguments": [{
+                "documentId": document_id,
+                "status": "QUEUED",
+                "message": "Mis en file d'attente"
+            }]
+        })
+    except Exception as exc:
+        logger.error("[Cosmos] Échec mise à jour QUEUED : %s", exc)
+
+    signalRMessages.set(json.dumps(signalr_events))
+    logger.info("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# 2. Service Bus Trigger (Traitement IA)
+# ---------------------------------------------------------------------------
+
+@app.service_bus_queue_trigger(
+    arg_name="azservicebus",
+    queue_name="document-processing",
+    connection="SERVICE_BUS_CONNECTION_STRING"
+)
+@app.generic_output_binding(
+    arg_name="signalRMessages",
+    type="signalR",
+    hubName="documents",
+    connectionStringSetting="SIGNALR_CONNECTION_STRING"
+)
+def service_bus_processing_worker(azservicebus: func.ServiceBusMessage, signalRMessages: func.Out[str]) -> None:
+    logger.info("=" * 60)
+    logger.info("[ServiceBusTrigger] Réception d'un message")
+
+    try:
+        body = azservicebus.get_body().decode('utf-8')
+        msg = json.loads(body)
+    except Exception as exc:
+        logger.error("[ServiceBusTrigger] Erreur décodage message")
+        raise
+
+    document_id = msg.get("documentId")
+    file_name = msg.get("fileName")
+
+    if not document_id or not file_name:
+        raise ValueError("Message invalide : documentId ou fileName manquant")
+
+    signalr_events = []
+
+    try:
+        patch_job(document_id, {"status": "PROCESSING"})
+        signalr_events.append({
+            "target": "jobUpdate",
+            "arguments": [{
+                "documentId": document_id,
+                "status": "PROCESSING",
+                "message": "Traitement IA en cours"
+            }]
+        })
+    except Exception as exc:
+        logger.error("[Cosmos] Erreur mise à jour PROCESSING : %s", exc)
+        raise
+
+    try:
+        tags = generate_tags(file_name)
+    except Exception as exc:
+        logger.error("[Tags] Erreur lors de l'appel IA : %s", exc)
+        try:
+            patch_job(document_id, {
+                "status": "ERROR",
+                "errorMessage": f"Erreur IA : {exc}",
+                "errorAt": _now_iso()
+            })
+        except Exception:
+            pass
+        # On envoie quand même le PROCESSING avant de planter
+        signalRMessages.set(json.dumps(signalr_events))
+        raise 
+
+    try:
+        patch_job(document_id, {
+            "status": "PROCESSED",
+            "tags": tags,
+            "processedAt": _now_iso()
+        })
+        signalr_events.append({
+            "target": "jobUpdate",
+            "arguments": [{
+                "documentId": document_id,
+                "status": "PROCESSED",
+                "message": "Tagging terminé",
+                "tags": tags
+            }]
+        })
+    except Exception as exc:
+        logger.error("[Cosmos] Erreur mise à jour PROCESSED : %s", exc)
+        raise
+    
+    signalRMessages.set(json.dumps(signalr_events))
+    logger.info("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# 3. Service Bus DLQ Trigger (Alertes)
+# ---------------------------------------------------------------------------
+
+@app.service_bus_queue_trigger(
+    arg_name="azservicebus",
+    queue_name="document-processing/$DeadLetterQueue",
+    connection="SERVICE_BUS_CONNECTION_STRING"
+)
+@app.generic_output_binding(
+    arg_name="signalRMessages",
+    type="signalR",
+    hubName="documents",
+    connectionStringSetting="SIGNALR_CONNECTION_STRING"
+)
+def dlq_alert_worker(azservicebus: func.ServiceBusMessage, signalRMessages: func.Out[str]) -> None:
+    """
+    Se déclenche quand un message finit dans la Dead Letter Queue.
+    Passe le statut à ERROR et envoie une notification SignalR.
+    """
+    logger.warning("=" * 60)
+    logger.warning("[DLQTrigger] Message reçu en Dead Letter Queue !")
+
+    try:
+        body = azservicebus.get_body().decode('utf-8')
+        msg = json.loads(body)
+    except Exception as exc:
+        logger.error("[DLQTrigger] Impossible de lire le message : %s", exc)
+        return
+    
+    document_id = msg.get("documentId")
+    if not document_id:
+        return
+        
+    error_message = "Message envoyé en DLQ après plusieurs échecs de traitement"
+    
+    try:
+        patch_job(document_id, {
+            "status": "ERROR",
+            "errorMessage": error_message,
+            "errorAt": _now_iso()
+        })
+    except Exception:
+        pass
+        
+    signalRMessages.set(json.dumps([{
+        "target": "jobUpdate",
+        "arguments": [{
+            "documentId": document_id,
+            "status": "ERROR",
+            "message": error_message
+        }]
+    }]))
+    
+    logger.warning("=" * 60)
