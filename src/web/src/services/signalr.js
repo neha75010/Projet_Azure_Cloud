@@ -26,11 +26,16 @@ function ensureHubHandler(connection) {
   state.hubHandlerRegistered = true;
 }
 
+function resolveHubUrl() {
+  const base = import.meta.env.VITE_FUNCTIONS_BASE_URL?.replace(/\/$/, "");
+  return base ? `${base}/api` : "/api";
+}
+
 export function getSignalRConnection() {
   const state = getState();
   if (!state.connectionPromise) {
     const connection = new signalR.HubConnectionBuilder()
-      .withUrl("/api")
+      .withUrl(resolveHubUrl())
       .withAutomaticReconnect()
       .build();
     state.connectionPromise = connection

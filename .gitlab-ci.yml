@@ -11,18 +11,20 @@ variables:
   # AZURE_SUBSCRIPTION_ID
   # AZURE_RESOURCE_GROUP
   # AZURE_FUNCTION_APP_NAME
-  # AZURE_WEBAPP_API_NAME          (défaut: api-doc-pipeline-jn)
-  # AZURE_STATIC_WEB_APP_TOKEN
+  # AZURE_WEBAPP_API_NAME          (défaut: api-doc-pipeline-jn-a6h4cug9eeh4ajbp)
+  # AZURE_STATIC_WEB_APP_TOKEN     (optionnel — souvent bloqué sur Azure for Students)
+  # VITE_FUNCTIONS_BASE_URL        (URL Function App sans /api, pour SignalR en prod)
   # COSMOS_ENDPOINT
   # COSMOS_KEY
   # SERVICE_BUS_CONNECTION_STRING
   # SIGNALR_CONNECTION_STRING
   # OPENAI_API_KEY
   # BLOB_CONNECTION_STRING
-  # VITE_API_URL                   (ex. https://api-doc-pipeline-jn.azurewebsites.net)
+  # VITE_API_URL                   (ex. https://api-doc-pipeline-jn-a6h4cug9eeh4ajbp.austriaeast-01.azurewebsites.net)
 
 # ==============================================================================
-# FRONTEND REACT (Azure Static Web Apps)
+# FRONTEND REACT
+# SWA souvent impossible sur Azure for Students → site statique Storage ($web)
 # ==============================================================================
 build_frontend:
   stage: build
@@ -30,7 +32,8 @@ build_frontend:
   script:
     - cd src/web
     - npm ci
-    - export VITE_API_URL="${VITE_API_URL:-https://api-doc-pipeline-jn.azurewebsites.net}"
+    - export VITE_API_URL="${VITE_API_URL:-https://api-doc-pipeline-jn-a6h4cug9eeh4ajbp.austriaeast-01.azurewebsites.net}"
+    - export VITE_FUNCTIONS_BASE_URL="${VITE_FUNCTIONS_BASE_URL:-https://func-doc-pipeline-jn-hnd2ethah8gtcpg8.austriaeast-01.azurewebsites.net}"
     - npm run build
   artifacts:
     paths:
@@ -39,7 +42,37 @@ build_frontend:
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
 
-deploy_frontend:
+# Hébergement React sur le Storage existant (fonctionne sur abonnement étudiant)
+deploy_frontend_storage:
+  stage: deploy
+  image: mcr.microsoft.com/azure-cli
+  needs:
+    - build_frontend
+  script:
+    - az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
+    - az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+    - STORAGE_ACCOUNT=$(echo "$BLOB_CONNECTION_STRING" | sed -n 's/.*AccountName=\([^;]*\).*/\1/p')
+    - test -n "$STORAGE_ACCOUNT"
+    - >
+      az storage blob service-properties update
+      --account-name "$STORAGE_ACCOUNT"
+      --connection-string "$BLOB_CONNECTION_STRING"
+      --static-website
+      --index-document index.html
+      --404-document index.html
+    - >
+      az storage blob upload-batch
+      --destination '$web'
+      --source src/web/dist
+      --connection-string "$BLOB_CONNECTION_STRING"
+      --overwrite
+    - STATIC_URL=$(az storage account show --name "$STORAGE_ACCOUNT" --query "primaryEndpoints.web" -o tsv)
+    - echo "Frontend URL => ${STATIC_URL}"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Static Web App — uniquement si vous avez un token (souvent indisponible en étudiant)
+deploy_frontend_swa:
   stage: deploy
   image: node:22-alpine
   needs:
@@ -48,7 +81,7 @@ deploy_frontend:
     - npm install -g @azure/static-web-apps-cli
     - swa deploy ./src/web/dist --deployment-token "$AZURE_STATIC_WEB_APP_TOKEN" --env production
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "main" && $AZURE_STATIC_WEB_APP_TOKEN != null && $AZURE_STATIC_WEB_APP_TOKEN != ""
 
 # ==============================================================================
 # API FASTAPI (App Service Linux — zip deploy)
@@ -57,7 +90,7 @@ deploy_api:
   stage: deploy
   image: mcr.microsoft.com/azure-cli
   variables:
-    API_APP_NAME: "${AZURE_WEBAPP_API_NAME:-api-doc-pipeline-jn}"
+    API_APP_NAME: "${AZURE_WEBAPP_API_NAME:-api-doc-pipeline-jn-a6h4cug9eeh4ajbp}"
   script:
     - az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
     - az account set --subscription "$AZURE_SUBSCRIPTION_ID"
