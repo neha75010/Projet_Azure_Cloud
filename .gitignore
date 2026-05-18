@@ -138,5 +138,6 @@ infra/arm/*.deployment.json
 tmp/
 temp/
 .cache/
-azure-setup-etudiant.md
-conventions.md
+function-deploy.zip
+function.zip
+api.zip

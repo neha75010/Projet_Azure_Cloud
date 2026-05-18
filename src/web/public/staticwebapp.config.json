@@ -1,0 +1,15 @@
+{
+  "routes": [
+    {
+      "route": "/api/*",
+      "rewrite": "https://func-doc-pipeline-jn-hnd2ethah8gtcpg8.austriaeast-01.azurewebsites.net/api/:splat"
+    }
+  ],
+  "navigationFallback": {
+    "rewrite": "/index.html",
+    "exclude": ["/api/*", "*.{css,js,png,jpg,svg,ico,woff2}"]
+  },
+  "globalHeaders": {
+    "content-security-policy": "default-src https: 'unsafe-eval' 'unsafe-inline'; connect-src https: wss:;"
+  }
+}
